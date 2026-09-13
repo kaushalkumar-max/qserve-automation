@@ -1,0 +1,182 @@
+# QServe automation - all stages in one workflow.
+#
+# Pick a stage from the dropdown when you click "Run workflow":
+#   m1_emulator - does an emulator boot?            (needs nothing)
+#   m2_install  - does the APK install and launch?  (needs apk_url)
+#   m3_appium   - can Appium read the screen?       (needs apk_url)
+#   m4_login    - does the login flow work?         (needs apk_url + QR secret)
+#
+# Work through them in order. Each one builds on the last.
+
+name: QServe
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Which stage to run"
+        required: true
+        default: "m1_emulator"
+        type: choice
+        options:
+          - m1_emulator
+          - m2_install
+          - m3_appium
+          - m4_login
+      apk_url:
+        description: "APK download URL (leave blank for m1_emulator)"
+        required: false
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Hardware acceleration. Without this the emulator is unusably slow.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up Python
+        if: inputs.stage != 'm1_emulator'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        if: inputs.stage == 'm3_appium' || inputs.stage == 'm4_login'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Appium
+        if: inputs.stage == 'm3_appium' || inputs.stage == 'm4_login'
+        run: |
+          npm install -g appium@2
+          appium driver install uiautomator2
+          pip install Appium-Python-Client selenium
+
+      - name: Download APK
+        if: inputs.stage != 'm1_emulator'
+        run: |
+          if [ -z "${{ inputs.apk_url }}" ]; then
+            echo "::error::This stage needs an APK URL. Re-run and paste one in."
+            exit 1
+          fi
+          mkdir -p build
+          curl -L --fail -o build/app.apk "${{ inputs.apk_url }}"
+          ls -lh build/app.apk
+
+      - name: Run on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          STAGE: ${{ inputs.stage }}
+          QSERVE_QR_B64: ${{ secrets.QSERVE_QR_B64 }}
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_5
+          ram-size: 4096M
+          disk-size: 6G
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          script: |
+            set -e
+            PKG="com.qart.qserve"
+            mkdir -p artifacts
+
+            echo "########## EMULATOR IS ALIVE ##########"
+            adb devices
+            echo "Android: $(adb shell getprop ro.build.version.release)"
+            echo "API:     $(adb shell getprop ro.build.version.sdk)"
+            echo "ABI:     $(adb shell getprop ro.product.cpu.abi)"
+            if adb shell pm list packages | grep -q "com.google.android.gms"; then
+              echo "Play Services: YES (google_apis image confirmed)"
+            else
+              echo "Play Services: NO - wrong system image!"
+            fi
+
+            if [ "$STAGE" = "m1_emulator" ]; then
+              echo "########## M1 PASSED ##########"
+              exit 0
+            fi
+
+            echo "########## INSTALLING APK ##########"
+            adb install -g -r build/app.apk
+            # Wipe ObjectBox DB + prefs so runs never contaminate each other.
+            adb shell pm clear "$PKG"
+            echo "Installed version: $(adb shell dumpsys package $PKG | grep versionName | head -1)"
+
+            adb logcat -c
+
+            if [ "$STAGE" = "m2_install" ]; then
+              echo "########## LAUNCHING APP ##########"
+              adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1
+              sleep 15
+              adb exec-out screencap -p > artifacts/launch.png
+              echo "Foreground: $(adb shell dumpsys window | grep -E 'mCurrentFocus' | head -1)"
+              adb logcat -d | grep -E "FATAL EXCEPTION|ANR in|E/flutter" \
+                > artifacts/crashes.txt || echo "no crashes detected" > artifacts/crashes.txt
+              echo "--- crashes.txt ---"; cat artifacts/crashes.txt
+              echo "########## M2 DONE - check launch.png in artifacts ##########"
+              exit 0
+            fi
+
+            if [ "$STAGE" = "m4_login" ]; then
+              echo "########## INJECTING QR ##########"
+              if [ -z "${QSERVE_QR_B64:-}" ]; then
+                echo "::error::QSERVE_QR_B64 secret is not set."
+                exit 1
+              fi
+              mkdir -p .qr
+              echo "$QSERVE_QR_B64" | base64 -d > .qr/qr.png
+              adb push .qr/qr.png /sdcard/Pictures/qr.png
+              adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE \
+                -d file:///sdcard/Pictures/qr.png
+              rm -rf .qr
+              sleep 2
+            fi
+
+            echo "########## STARTING APPIUM ##########"
+            appium --log-level error --log artifacts/appium.log &
+            for i in $(seq 1 40); do
+              curl -sf http://127.0.0.1:4723/status > /dev/null && break
+              sleep 1
+            done
+            echo "Appium ready"
+
+            adb shell screenrecord --bit-rate 2000000 --time-limit 180 /sdcard/run.mp4 &
+            REC=$!
+
+            set +e
+            python tests/run_test.py --stage "$STAGE"
+            CODE=$?
+            set -e
+
+            kill $REC 2>/dev/null || true
+            sleep 3
+            adb pull /sdcard/run.mp4 artifacts/run.mp4 || echo "no video"
+            adb logcat -d | grep -E "FATAL EXCEPTION|ANR in|E/flutter" \
+              > artifacts/crashes.txt || echo "no crashes detected" > artifacts/crashes.txt
+            echo "--- crashes.txt ---"; cat artifacts/crashes.txt
+
+            exit $CODE
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.stage }}-run-${{ github.run_number }}
+          path: artifacts/**
+          retention-days: 14
+          if-no-files-found: warn
