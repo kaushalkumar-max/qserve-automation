@@ -27,6 +27,13 @@ if [ "$STAGE" = "m1_emulator" ]; then
   exit 0
 fi
 
+echo "########## SETTLING LAUNCHER ##########"
+# Give the home screen time to finish booting, and stop Android showing
+# ANR dialogs for background apps. Without this the launcher's "isn't
+# responding" popup sits on top of our app and eats Appium taps.
+adb shell settings put global hide_error_dialogs 1
+adb shell am wait-for-broadcast-idle || true
+sleep 5
 echo "########## INSTALLING APK ##########"
 adb install -g -r build/app.apk
 # Wipe ObjectBox DB + prefs so runs never contaminate each other.
