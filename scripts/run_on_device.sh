@@ -9,6 +9,7 @@ set -e
 STAGE="${STAGE:-m1_emulator}"
 PKG="com.qart.qserve"
 mkdir -p artifacts
+echo "########## STAGE = $STAGE ##########"
 
 echo "########## EMULATOR IS ALIVE ##########"
 adb devices
