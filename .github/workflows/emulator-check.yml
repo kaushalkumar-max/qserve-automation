@@ -1,0 +1,54 @@
+# MILESTONE 1 - does an Android emulator boot on GitHub's machines?
+#
+# This is the only question this file answers. No APK, no Appium, no secrets.
+# If this goes green, the foundation works and we build on it.
+
+name: M1 - Emulator Check
+
+on:
+  workflow_dispatch:        # adds a "Run workflow" button in the Actions tab
+
+jobs:
+  boot-emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Lets the emulator use hardware acceleration. Without this it is
+      # unusably slow.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot emulator and report
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis      # your app needs Play Services for Firebase
+          arch: x86_64             # your APK has x86_64, so this runs natively
+          profile: pixel_5
+          ram-size: 4096M
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            echo "===================================="
+            echo " EMULATOR IS ALIVE"
+            echo "===================================="
+            adb devices
+            echo "--- Android version ---"
+            adb shell getprop ro.build.version.release
+            echo "--- API level ---"
+            adb shell getprop ro.build.version.sdk
+            echo "--- CPU ABI ---"
+            adb shell getprop ro.product.cpu.abi
+            echo "--- Play Services present? ---"
+            adb shell pm list packages | grep -c "com.google.android.gms" \
+              && echo "YES - Google APIs image confirmed" \
+              || echo "NO - wrong system image"
+            echo "===================================="
